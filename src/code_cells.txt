@@ -1,0 +1,604 @@
+Cell 0:
+# =============================================================
+# Cell 1: Imports & Setup
+# =============================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import seaborn as sns
+import joblib
+import warnings
+import time
+import os
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from xgboost import XGBRegressor
+
+warnings.filterwarnings('ignore')
+
+# ------ Global Style Configuration ------
+TEAL_DARK   = '#0D9488'
+TEAL_LIGHT  = '#14B8A6'
+SLATE_DARK  = '#0F172A'
+SLATE_MID   = '#1E293B'
+AMBER       = '#F59E0B'
+BG_COLOR    = '#F8FAFC'
+
+plt.rcParams.update({
+    'figure.facecolor': BG_COLOR,
+    'axes.facecolor':   BG_COLOR,
+    'axes.edgecolor':   SLATE_MID,
+    'axes.labelcolor':  SLATE_DARK,
+    'axes.titlesize':   13,
+    'axes.titleweight': 'bold',
+    'axes.titlecolor':  SLATE_DARK,
+    'xtick.color':      SLATE_DARK,
+    'ytick.color':      SLATE_DARK,
+    'text.color':       SLATE_DARK,
+    'grid.color':       '#CBD5E1',
+    'grid.linestyle':   '--',
+    'grid.linewidth':   0.6,
+    'font.family':      'DejaVu Sans',
+})
+
+print('All libraries imported successfully.')
+print(f'Pandas  : {pd.__version__}')
+print(f'NumPy   : {np.__version__}')
+print(f'Sklearn : {__import__("sklearn").__version__}')
+print(f'XGBoost : {__import__("xgboost").__version__}')
+
+Cell 1:
+# =============================================================
+# Cell 2: Data Loading & Initial Exploration
+# =============================================================
+
+# Load the dataset
+DATA_PATH = 'dataset/city_day.csv'
+df_raw = pd.read_csv(DATA_PATH)
+
+print('=' * 55)
+print('  DATASET OVERVIEW')
+print('=' * 55)
+print(f'  Shape  : {df_raw.shape[0]:,} rows  x  {df_raw.shape[1]} columns')
+print(f'  Cities : {df_raw["City"].nunique()}')
+print(f'  Date range : {df_raw["Date"].min()}  →  {df_raw["Date"].max()}')
+print('=' * 55)
+
+# Basic schema
+print('\n--- dtypes & non-null counts ---')
+df_raw.info()
+
+# First rows
+print('\n--- First 5 rows ---')
+display(df_raw.head())
+
+# Descriptive statistics
+print('\n--- Descriptive Statistics ---')
+display(df_raw.describe().round(2))
+
+# Missing values
+print('\n--- Missing Values per Column ---')
+missing = df_raw.isnull().sum()
+missing_pct = (missing / len(df_raw) * 100).round(2)
+missing_df = pd.DataFrame({'Missing Count': missing, 'Missing %': missing_pct})
+display(missing_df[missing_df['Missing Count'] > 0].sort_values('Missing %', ascending=False))
+
+Cell 2:
+# =============================================================
+# Cell 3: Data Cleaning
+# =============================================================
+
+df = df_raw.copy()
+
+# ── 3.1  Drop rows where AQI itself is missing (can't train on them) ──
+before = len(df)
+df.dropna(subset=['AQI'], inplace=True)
+print(f'Dropped {before - len(df):,} rows with null AQI  →  {len(df):,} rows remain')
+
+# ── 3.2  Median imputation of pollutant columns grouped by City ──
+POLLUTANTS = ['PM2.5', 'PM10', 'NO', 'NO2', 'NOx',
+              'NH3', 'CO', 'SO2', 'O3', 'Benzene', 'Toluene', 'Xylene']
+
+def city_median_fill(group):
+    """Fill NaN with city-level median; fallback to global median."""
+    for col in POLLUTANTS:
+        median_val = group[col].median()
+        group[col] = group[col].fillna(median_val)
+    return group
+
+df = df.groupby('City', group_keys=False).apply(city_median_fill)
+
+# Fallback: any remaining NaNs → global median
+for col in POLLUTANTS:
+    df[col].fillna(df[col].median(), inplace=True)
+
+print(f'Remaining NaNs in pollutant columns: {df[POLLUTANTS].isnull().sum().sum()}')
+
+# ── 3.3  Date parsing & temporal features ──
+df['Date'] = pd.to_datetime(df['Date'])
+df['Year']       = df['Date'].dt.year
+df['Month']      = df['Date'].dt.month
+df['DayOfWeek']  = df['Date'].dt.dayofweek     # 0=Monday … 6=Sunday
+
+# ── 3.4  Create target: next-day AQI (shift by -1 within each city) ──
+df.sort_values(['City', 'Date'], inplace=True)
+df['AQI_Tomorrow'] = df.groupby('City')['AQI'].shift(-1)
+
+# Drop the last record per city (no tomorrow known)
+before = len(df)
+df.dropna(subset=['AQI_Tomorrow'], inplace=True)
+print(f'Dropped {before - len(df):,} rows with null AQI_Tomorrow  →  {len(df):,} rows remain')
+
+df.reset_index(drop=True, inplace=True)
+
+print('\n--- Cleaned DataFrame (first 5 rows) ---')
+display(df[['City', 'Date', 'AQI', 'AQI_Tomorrow', 'Month', 'DayOfWeek']].head())
+print(f'\nFinal dataset shape: {df.shape}')
+
+Cell 3:
+# =============================================================
+# Cell 4: Exploratory Data Analysis (Visualizations)
+# =============================================================
+
+fig = plt.figure(figsize=(20, 22))
+fig.patch.set_facecolor(BG_COLOR)
+fig.suptitle('Air Quality Index — Exploratory Data Analysis',
+             fontsize=17, fontweight='bold', color=SLATE_DARK, y=1.01)
+
+# ── Plot 1: AQI Distribution ──────────────────────────────────
+ax1 = fig.add_subplot(3, 2, 1)
+ax1.hist(df['AQI'], bins=60, color=TEAL_DARK, edgecolor='white',
+         linewidth=0.4, alpha=0.85, density=True, label='Histogram')
+
+# KDE overlay
+from scipy.stats import gaussian_kde
+kde_x = np.linspace(df['AQI'].min(), df['AQI'].max(), 300)
+kde = gaussian_kde(df['AQI'].dropna())
+ax1.plot(kde_x, kde(kde_x), color=AMBER, linewidth=2.2, label='KDE')
+ax1.set_title('Distribution of AQI Values')
+ax1.set_xlabel('AQI')
+ax1.set_ylabel('Density')
+ax1.legend(framealpha=0.5)
+ax1.grid(True, alpha=0.4)
+
+# ── Plot 2: AQI Trend Over Years (monthly average) ────────────
+ax2 = fig.add_subplot(3, 2, 2)
+monthly_avg = (df.groupby(['Year', 'Month'])['AQI']
+                 .mean()
+                 .reset_index())
+monthly_avg['Period'] = pd.to_datetime(
+    monthly_avg['Year'].astype(str) + '-' + monthly_avg['Month'].astype(str).str.zfill(2)
+)
+monthly_avg.sort_values('Period', inplace=True)
+
+ax2.plot(monthly_avg['Period'], monthly_avg['AQI'],
+         color=TEAL_DARK, linewidth=1.8)
+ax2.fill_between(monthly_avg['Period'], monthly_avg['AQI'],
+                 alpha=0.15, color=TEAL_LIGHT)
+ax2.set_title('Monthly Average AQI Trend')
+ax2.set_xlabel('Date') 
+ax2.set_ylabel('Mean AQI')
+ax2.tick_params(axis='x', rotation=30)
+ax2.grid(True, alpha=0.4)
+
+# ── Plot 3: Correlation Heatmap ───────────────────────────────
+ax3 = fig.add_subplot(3, 2, 3)
+corr_cols = POLLUTANTS + ['AQI']
+corr_matrix = df[corr_cols].corr()
+mask = np.triu(np.ones_like(corr_matrix, dtype=bool))  # upper triangle
+
+cmap = sns.diverging_palette(160, 30, s=80, l=50, as_cmap=True)
+sns.heatmap(corr_matrix, mask=mask, cmap=cmap, center=0,
+            annot=True, fmt='.2f', annot_kws={'size': 7},
+            linewidths=0.5, linecolor='white',
+            cbar_kws={'shrink': 0.7},
+            ax=ax3)
+ax3.set_title('Correlation Heatmap — Pollutants vs AQI')
+ax3.tick_params(axis='x', rotation=45, labelsize=8)
+ax3.tick_params(axis='y', rotation=0,  labelsize=8)
+
+# ── Plot 4: Top 10 Most Polluted Cities ───────────────────────
+ax4 = fig.add_subplot(3, 2, 4)
+top10 = (df.groupby('City')['AQI']
+           .mean()
+           .sort_values(ascending=False)
+           .head(10))
+
+bars = ax4.barh(top10.index[::-1], top10.values[::-1],
+                color=TEAL_DARK, edgecolor='white', linewidth=0.4)
+# Highlight top bar in amber
+bars[-1].set_color(AMBER)
+
+for bar, val in zip(bars, top10.values[::-1]):
+    ax4.text(bar.get_width() + 2, bar.get_y() + bar.get_height() / 2,
+             f'{val:.0f}', va='center', fontsize=8, color=SLATE_DARK)
+
+ax4.set_title('Top 10 Most Polluted Cities (Mean AQI)')
+ax4.set_xlabel('Mean AQI')
+ax4.grid(True, axis='x', alpha=0.4)
+
+# ── Plot 5: AQI Boxplot by AQI_Bucket ────────────────────────
+ax5 = fig.add_subplot(3, 1, 3)
+bucket_order = ['Good', 'Satisfactory', 'Moderate', 'Poor', 'Very Poor', 'Severe']
+bucket_colors = ['#22C55E', '#84CC16', '#F59E0B', '#F97316', '#EF4444', '#991B1B']
+
+valid_buckets = [b for b in bucket_order if b in df['AQI_Bucket'].unique()]
+df_bucket = df[df['AQI_Bucket'].isin(valid_buckets)]
+
+bp = ax5.boxplot(
+    [df_bucket[df_bucket['AQI_Bucket'] == b]['AQI'].values for b in valid_buckets],
+    patch_artist=True,
+    labels=valid_buckets,
+    medianprops=dict(color=SLATE_DARK, linewidth=2),
+    whiskerprops=dict(color=SLATE_MID),
+    capprops=dict(color=SLATE_MID),
+    flierprops=dict(marker='o', markersize=3, alpha=0.3, color=SLATE_MID)
+)
+for patch, color in zip(bp['boxes'], bucket_colors[:len(valid_buckets)]):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.75)
+
+ax5.set_title('AQI Distribution by AQI Bucket Category')
+ax5.set_xlabel('AQI Bucket')
+ax5.set_ylabel('AQI Value')
+ax5.grid(True, axis='y', alpha=0.4)
+
+plt.tight_layout()
+plt.savefig('eda_plots.png', dpi=150, bbox_inches='tight',
+            facecolor=BG_COLOR)
+plt.show()
+print('EDA plots saved to eda_plots.png')
+
+Cell 4:
+# =============================================================
+# Cell 5: Feature Engineering & Train-Test Split
+# =============================================================
+
+FEATURES = [
+    'PM2.5', 'PM10', 'NO', 'NO2', 'NOx', 'NH3',
+    'CO', 'SO2', 'O3', 'Benzene', 'Toluene', 'Xylene',
+    'Month', 'DayOfWeek'
+]
+TARGET = 'AQI_Tomorrow'
+
+X = df[FEATURES].copy()
+y = df[TARGET].copy()
+
+print(f'Feature matrix shape : {X.shape}')
+print(f'Target vector shape  : {y.shape}')
+print(f'Target range         : [{y.min():.1f}, {y.max():.1f}]')
+print(f'Target mean          : {y.mean():.1f}  |  std: {y.std():.1f}')
+
+# ── 80 / 20 split — no shuffle to preserve temporal order ──
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=42, shuffle=True
+)
+print(f'\nTrain set : {len(X_train):,} samples')
+print(f'Test  set : {len(X_test):,} samples')
+
+# ── StandardScaler (fit on train only to avoid leakage) ──
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled  = scaler.transform(X_test)
+
+# Save scaler for the inference pipeline
+joblib.dump(scaler, 'scaler.pkl')
+print('\nScaler saved → scaler.pkl')
+
+# Save feature names for schema validation in prediction
+joblib.dump(FEATURES, 'feature_names.pkl')
+print('Feature names saved → feature_names.pkl')
+
+Cell 5:
+# =============================================================
+# Cell 6: Model Training — XGBRegressor
+# =============================================================
+
+model = XGBRegressor(
+    n_estimators      = 500,
+    max_depth         = 6,
+    learning_rate     = 0.05,
+    subsample         = 0.8,
+    colsample_bytree  = 0.8,
+    reg_alpha         = 0.1,
+    reg_lambda        = 1.0,
+    random_state      = 42,
+    n_jobs            = -1,       # use all CPU cores
+    eval_metric       = 'rmse',
+    verbosity         = 0
+)
+
+print('Training XGBoost model …')
+t0 = time.time()
+
+model.fit(
+    X_train_scaled, y_train,
+    eval_set=[(X_test_scaled, y_test)],
+    verbose=False
+)
+
+elapsed = time.time() - t0
+print(f'Training complete in {elapsed:.2f} seconds.')
+print(f'Total estimators trained : {model.n_estimators}')
+
+
+Cell 6:
+# =============================================================
+# Cell 7: Model Evaluation & Visualizations
+# =============================================================
+
+y_pred = model.predict(X_test_scaled)
+
+# ── Metrics ──────────────────────────────────────────────────
+mae  = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+r2   = r2_score(y_test, y_pred)
+
+nonzero_mask = y_test.values != 0
+                       / y_test.values[nonzero_mask])) * 100
+
+print('=' * 45)
+print('  MODEL PERFORMANCE ON TEST SET')
+print('=' * 45)
+print(f'  MAE   : {mae:.3f}')
+print(f'  RMSE  : {rmse:.3f}')
+print(f'  R²    : {r2:.4f}  ({r2*100:.2f}% variance explained)')
+print('=' * 45)
+
+# ── Residuals ────────────────────────────────────────────────
+residuals = y_test.values - y_pred
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 13))
+fig.patch.set_facecolor(BG_COLOR)
+fig.suptitle('Model Evaluation — XGBoost AQI Predictor',
+             fontsize=15, fontweight='bold', color=SLATE_DARK)
+
+# ── Plot 1: Actual vs Predicted scatter ───────────────────────
+ax = axes[0, 0]
+ax.scatter(y_test, y_pred, alpha=0.35, s=14,
+           color=TEAL_DARK, edgecolors='none')
+lims = [min(y_test.min(), y_pred.min()) - 10,
+        max(y_test.max(), y_pred.max()) + 10]
+ax.plot(lims, lims, color=AMBER, linewidth=2, linestyle='--', label='Ideal')
+ax.set_xlim(lims); ax.set_ylim(lims)
+ax.set_title('Actual vs Predicted AQI')
+ax.set_xlabel('Actual AQI')
+ax.set_ylabel('Predicted AQI')
+ax.legend()
+ax.grid(True, alpha=0.4)
+# Annotate metrics
+ax.text(0.04, 0.93, f'R² = {r2:.3f}\nRMSE = {rmse:.2f}',
+        transform=ax.transAxes, fontsize=9,
+        verticalalignment='top',
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                  edgecolor=SLATE_MID, alpha=0.8))
+
+# ── Plot 2: Residual distribution ────────────────────────────
+ax = axes[0, 1]
+ax.hist(residuals, bins=60, color=TEAL_DARK, edgecolor='white',
+        linewidth=0.4, alpha=0.85, density=True)
+kde_r = gaussian_kde(residuals)
+rx = np.linspace(residuals.min(), residuals.max(), 300)
+ax.plot(rx, kde_r(rx), color=AMBER, linewidth=2.2)
+ax.axvline(0, color=SLATE_DARK, linewidth=1.5, linestyle='--')
+ax.set_title('Residual Distribution')
+ax.set_xlabel('Residual (Actual − Predicted)')
+ax.set_ylabel('Density')
+ax.grid(True, alpha=0.4)
+
+# ── Plot 3: Feature Importance (top 12) ──────────────────────
+ax = axes[1, 0]
+importances = pd.Series(model.feature_importances_, index=FEATURES)
+top12 = importances.sort_values(ascending=True).tail(12)
+
+colors = [AMBER if i == len(top12) - 1 else TEAL_DARK
+          for i in range(len(top12))]
+top12.plot(kind='barh', ax=ax, color=colors, edgecolor='white', linewidth=0.4)
+ax.set_title('Feature Importance (Top 12)')
+ax.set_xlabel('Importance Score')
+ax.grid(True, axis='x', alpha=0.4)
+
+# ── Plot 4: Actual vs Predicted — first 100 test samples ─────
+ax = axes[1, 1]
+n = 100
+ax.plot(range(n), y_test.values[:n], color=SLATE_DARK,
+        linewidth=1.5, label='Actual', zorder=2)
+ax.plot(range(n), y_pred[:n], color=TEAL_DARK,
+        linewidth=1.5, linestyle='--', label='Predicted', zorder=3)
+ax.fill_between(range(n), y_test.values[:n], y_pred[:n],
+                alpha=0.12, color=AMBER)
+ax.set_title('Actual vs Predicted — First 100 Test Samples')
+ax.set_xlabel('Sample Index')
+ax.set_ylabel('AQI')
+ax.legend()
+ax.grid(True, alpha=0.4)
+
+plt.tight_layout()
+plt.savefig('model_evaluation.png', dpi=150, bbox_inches='tight',
+            facecolor=BG_COLOR)
+plt.show()
+print('Evaluation plots saved to model_evaluation.png')
+
+Cell 7:
+# =============================================================
+# Cell 8: AQI Category Classification Function
+# =============================================================
+
+def get_aqi_category(aqi_value: float) -> dict:
+    """
+    Map a numeric AQI value to its category, colour code, and
+    associated health advice.
+
+    Parameters
+    ----------
+    aqi_value : float
+        Predicted or measured AQI.
+
+    Returns
+    -------
+    dict with keys: category, color, advice
+    """
+    aqi = float(aqi_value)
+
+    if aqi <= 50:
+        return {
+            'category': 'Good',
+            'color':    '#22C55E',
+            'advice':   'Air quality is satisfactory. No restrictions.'
+        }
+    elif aqi <= 100:
+        return {
+            'category': 'Satisfactory',
+            'color':    '#84CC16',
+            'advice':   'Air quality is acceptable. Unusually sensitive people should consider reducing prolonged outdoor exertion.'
+        }
+    elif aqi <= 200:
+        return {
+            'category': 'Moderate',
+            'color':    '#F59E0B',
+            'advice':   'Members of sensitive groups may experience health effects. General public less likely to be affected.'
+        }
+    elif aqi <= 300:
+        return {
+            'category': 'Poor',
+            'color':    '#F97316',
+            'advice':   'Everyone may begin to experience health effects. Sensitive groups should avoid outdoor activity.'
+        }
+    elif aqi <= 400:
+        return {
+            'category': 'Very Poor',
+            'color':    '#EF4444',
+            'advice':   'Health warnings of emergency conditions. The entire population is likely to be affected. Avoid outdoor activity.'
+        }
+    elif aqi <= 500:
+        return {
+            'category': 'Severe',
+            'color':    '#991B1B',
+            'advice':   'Serious health effects. Avoid all outdoor exertion. Keep windows closed and use air purifiers indoors.'
+        }
+    else:
+        return {
+            'category': 'Hazardous',
+            'color':    '#581C87',
+            'advice':   'Emergency conditions. Everyone should avoid all outdoor activity. Seek medical advice if symptoms appear.'
+        }
+
+
+# ── Quick sanity check across the AQI scale ──────────────────
+print('AQI Category Look-up Table')
+print('-' * 62)
+for test_val in [25, 75, 150, 250, 350, 450, 550]:
+    info = get_aqi_category(test_val)
+    print(f'  AQI {test_val:>4}  →  {info["category"]:<13}  {info["color"]}')
+print('-' * 62)
+
+Cell 8:
+# =============================================================
+# Cell 9: Save Model & Artifacts
+# =============================================================
+
+MODEL_PATH        = 'aqi_model.pkl'
+SCALER_PATH       = 'scaler.pkl'         # already saved in Cell 5
+FEATURES_PATH     = 'feature_names.pkl'  # already saved in Cell 5
+
+# Save XGBoost model
+joblib.dump(model, MODEL_PATH)
+
+# Helper to format file sizes
+def _size(path: str) -> str:
+    size_bytes = os.path.getsize(path)
+    if size_bytes >= 1_048_576:
+        return f'{size_bytes / 1_048_576:.2f} MB'
+    return f'{size_bytes / 1_024:.1f} KB'
+
+print('Artifacts saved successfully:')
+print(f'  {MODEL_PATH:<22} {_size(MODEL_PATH)}')
+print(f'  {SCALER_PATH:<22} {_size(SCALER_PATH)}')
+print(f'  {FEATURES_PATH:<22} {_size(FEATURES_PATH)}')
+print('\nAll artifacts ready for deployment.')
+
+Cell 9:
+# =============================================================
+# Cell 10: Test Prediction Pipeline
+# =============================================================
+# Simulates a real-time inference call using WAQI-style sensor data.
+
+# ── 10.1  Load saved artifacts ────────────────────────────────
+loaded_model    = joblib.load('aqi_model.pkl')
+loaded_scaler   = joblib.load('scaler.pkl')
+loaded_features = joblib.load('feature_names.pkl')
+print('Artifacts loaded successfully.\n')
+
+# ── 10.2  Sample input — mimics a WAQI API payload ───────────
+#          (values typical for a moderately polluted Indian city)
+sample_input = {
+    'PM2.5':     85.4,   # μg/m³
+    'PM10':     142.7,   # μg/m³
+    'NO':         8.3,   # μg/m³
+    'NO2':       32.1,   # μg/m³
+    'NOx':       40.6,   # ppb
+    'NH3':       15.2,   # μg/m³
+    'CO':         1.1,   # mg/m³
+    'SO2':       12.5,   # μg/m³
+    'O3':        38.9,   # μg/m³
+    'Benzene':    2.4,   # μg/m³
+    'Toluene':    8.7,   # μg/m³
+    'Xylene':     1.9,   # μg/m³
+    'Month':      11,    # November
+    'DayOfWeek':   2,    # Wednesday
+}
+
+# ── 10.3  Build input DataFrame (schema matches training) ─────
+input_df = pd.DataFrame([sample_input])[loaded_features]
+
+# ── 10.4  Scale → Predict ─────────────────────────────────────
+input_scaled  = loaded_scaler.transform(input_df)
+predicted_aqi = float(loaded_model.predict(input_scaled)[0])
+predicted_aqi = max(0.0, predicted_aqi)   # AQI cannot be negative
+
+# ── 10.5  Categorise & report ─────────────────────────────────
+info = get_aqi_category(predicted_aqi)
+
+health_map = {
+    'Good':         'No special precautions needed.',
+    'Satisfactory': 'Sensitive individuals should reduce prolonged outdoor activity.',
+    'Moderate':     'People with respiratory issues should limit outdoor exposure.',
+    'Poor':         'Wear N95 mask outdoors. Avoid strenuous activities.',
+    'Very Poor':    'Stay indoors. Use air purifiers. Seek medical advice if unwell.',
+    'Severe':       'Do not go outdoors. All residents should reduce outdoor activity.',
+    'Hazardous':    'Emergency situation. Evacuate if possible. Seek immediate medical attention.',
+}
+advice = health_map.get(info['category'], info['advice'])
+
+print('=' * 65)
+print('  NEXT-DAY AQI PREDICTION RESULT')
+print('=' * 65)
+print(f'  Predicted AQI : {predicted_aqi:.1f}')
+print(f'  Category      : {info["category"]}')
+print(f'  Color Code    : {info["color"]}')
+print(f'  Health Advice : {advice}')
+print('=' * 65)
+print(f'\nPredicted AQI: {predicted_aqi:.1f} | Category: {info["category"]} | Health Advice: {advice}')
+
+# ── 10.6  Visual badge ────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 2.2))
+fig.patch.set_facecolor(info['color'])
+ax.set_facecolor(info['color'])
+ax.axis('off')
+ax.text(0.5, 0.65, f'Predicted AQI: {predicted_aqi:.0f}',
+        ha='center', va='center', fontsize=20, fontweight='bold',
+        color='white', transform=ax.transAxes)
+ax.text(0.5, 0.25, info['category'],
+        ha='center', va='center', fontsize=14,
+        color='white', alpha=0.9, transform=ax.transAxes)
+plt.tight_layout()
+plt.show()
+
+Cell 10:
+
+
